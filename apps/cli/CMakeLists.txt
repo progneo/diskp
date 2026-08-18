@@ -5,5 +5,6 @@ add_executable(diskp_cli
 target_link_libraries(
         diskp_cli
         PRIVATE
-            diskp_core
+        diskp_core
+        diskp_utils
 )
