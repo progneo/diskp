@@ -1,64 +1,126 @@
 //
 // Created by Yaroslav on 18.08.2026.
 //
-#include <utility>
-
 #include "diskp/scanner.hpp"
 
-#include <iostream>
-#include <ostream>
 #include <filesystem>
 #include <sys/stat.h>
 
-namespace diskp {
-    void scanner::scan_directory(const std::filesystem::directory_entry &directory_entry) {
-        for (const auto &entry: std::filesystem::directory_iterator(directory_entry)) {
-            if (entry.is_directory()) {
-                std::cout << "[debug]: directory: " << entry.path() << std::endl;
-                this->count_of_directories += 1;
-                this->scan_directory(entry);
-            } else if (entry.is_regular_file()) {
-                std::cout << "[debug]: file: " << entry.path() << std::endl;
-                this->count_of_files += 1;
+#include "diskp/logger.hpp"
 
-                if (stat(entry.path().c_str(), &this->file_info) != 0) {
-                    std::cerr << "[error]: " << entry.path() << std::endl;
-                } else {
-                    this->total_apparent_size += file_info.st_size;
-                    this->total_allocated_size += file_info.st_blocks * 512;
+namespace diskp {
+    void scanner::scan_directory(const std::filesystem::directory_entry &directory_entry, scan_result &result) {
+        try {
+            std::error_code error_code;
+            std::filesystem::directory_options opts = std::filesystem::directory_options::skip_permission_denied;
+
+            for (const auto &entry: std::filesystem::directory_iterator(directory_entry, opts, error_code)) {
+                if (error_code) {
+                    result.error_list.push_back({
+                        .path = directory_entry.path().string(),
+                        .action = "read",
+                        .error_code = error_code
+                    });
+                    error_code.clear();
+                    continue;
+                }
+
+                if (entry.is_symlink()) {
+                    calculate_symlink_size(entry, result);
+                } else if (entry.is_directory()) {
+                    calculate_directory_size(entry, result);
+                    scan_directory(entry, result);
+                } else if (entry.is_regular_file()) {
+                    calculate_file_size(entry, result);
                 }
             }
+        } catch (const std::filesystem::filesystem_error &e) {
+            result.error_list.push_back({
+                .path = directory_entry.path().string(),
+                .action = "lstat",
+                .error_code = e.code()
+            });
         }
     }
 
-    scanner::scanner() : count_of_files(0), count_of_directories(0), total_apparent_size(0), total_allocated_size(0) {
+    void scanner::calculate_directory_size(const std::filesystem::directory_entry &directory_entry,
+                                           scan_result &result) {
+        struct stat file_info{};
+        result.count_of_directories += 1;
+
+        if (lstat(directory_entry.path().c_str(), &file_info) != 0) {
+            result.error_list.push_back({
+                .path = directory_entry.path().string(),
+                .action = "lstat"
+            });
+        } else {
+            result.total_apparent_size += file_info.st_size;
+            result.total_allocated_size += file_info.st_blocks * 512;
+        }
     }
 
-    scanner::~scanner() = default;
+    void scanner::calculate_file_size(const std::filesystem::directory_entry &directory_entry, scan_result &result) {
+        struct stat file_info{};
+        result.count_of_files += 1;
 
-    void scanner::start_scanning(const std::string &dir) {
-        this->directory = dir;
+        if (lstat(directory_entry.path().c_str(), &file_info) != 0) {
+            result.error_list.push_back({
+                .path = directory_entry.path().string(),
+                .action = "lstat"
+            });
+        } else {
+            result.total_apparent_size += file_info.st_size;
+            result.total_allocated_size += file_info.st_blocks * 512;
+        }
+    }
+
+    void scanner::calculate_symlink_size(const std::filesystem::directory_entry &directory_entry, scan_result &result) {
+        struct stat file_info{};
+        result.count_of_symlinks += 1;
+
+        if (lstat(directory_entry.path().c_str(), &file_info) != 0) {
+            result.error_list.push_back({
+                .path = directory_entry.path().string(),
+                .action = "lstat"
+            });
+        } else {
+            result.total_apparent_size += file_info.st_size;
+            result.total_allocated_size += file_info.st_blocks * 512;
+        }
+    }
+
+    scan_result scanner::start_scanning(const std::string &dir) {
+        scan_result result = {
+            .count_of_files = 0,
+            .count_of_directories = 0,
+            .count_of_symlinks = 0,
+            .total_apparent_size = 0,
+            .total_allocated_size = 0
+        };
 
         try {
-            if (std::filesystem::exists(this->directory) && std::filesystem::is_directory(this->directory)) {
-                const std::filesystem::directory_entry directoryEntry(this->directory);
+            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir)) {
+                std::error_code error_code;
 
-                this->scan_directory(directoryEntry);
+                const std::filesystem::directory_entry directory_entry(dir, error_code);
+                calculate_directory_size(directory_entry, result);
 
-                std::cout << "[info]: starting scanning directory: " << dir << std::endl;
+                if (!error_code) {
+                    scan_directory(directory_entry, result);
+                } else {
+                    result.error_list.push_back({
+                        .path = dir,
+                        .action = "init",
+                        .error_code = error_code
+                    });
+                }
             } else {
-                std::cerr << "[error]: provided path not exists or not a valid directory" << std::endl;
+                logger::error("provided path not exists or not a valid directory");
             }
         } catch (const std::filesystem::filesystem_error &e) {
-            std::cerr << "[error]: " << e.what() << std::endl;
+            logger::error(e.what());
         }
-    }
 
-    void scanner::print_results() const {
-        std::cout << "[info]: scanning results" << std::endl;
-        std::cout << "[info]: count of directories - " << this->count_of_directories << std::endl;
-        std::cout << "[info]: count of files - " << this->count_of_files << std::endl;
-        std::cout << "[info]: total allocated size - " << this->total_allocated_size << std::endl;
-        std::cout << "[info]: total apparent size - " << this->total_apparent_size << std::endl;
+        return result;
     }
 }
