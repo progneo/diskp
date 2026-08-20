@@ -31,7 +31,7 @@ namespace diskp {
 
     void logger::error(const std::string &message) {
         if (min_level >= log_level::ERROR) {
-            std::cout << "[error]: " << message << "\n";
+            std::cerr << "[error]: " << message << "\n";
         }
     }
 }

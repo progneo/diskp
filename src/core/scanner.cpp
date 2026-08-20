@@ -3,122 +3,135 @@
 //
 #include "diskp/scanner.hpp"
 
+#include <iostream>
+#include <queue>
 #include <filesystem>
+#include <unordered_set>
 #include <sys/stat.h>
 
-#include "diskp/logger.hpp"
+#include "diskp/inode_key.hpp"
 
 namespace diskp {
-    void scanner::scan_directory(const std::filesystem::directory_entry &directory_entry, scan_result &result) {
-        try {
-            std::error_code error_code;
-            std::filesystem::directory_options opts = std::filesystem::directory_options::skip_permission_denied;
+    constexpr auto dir_opts = std::filesystem::directory_options::skip_permission_denied;
+    constexpr std::uint64_t block_unit_bytes = 512;
 
-            for (const auto &entry: std::filesystem::directory_iterator(directory_entry, opts, error_code)) {
-                if (error_code) {
-                    result.error_list.push_back({
-                        .path = directory_entry.path().string(),
-                        .action = "read",
-                        .error_code = error_code
-                    });
-                    error_code.clear();
-                    continue;
-                }
-
-                if (entry.is_symlink()) {
-                    calculate_symlink_size(entry, result);
-                } else if (entry.is_directory()) {
-                    calculate_directory_size(entry, result);
-                    scan_directory(entry, result);
-                } else if (entry.is_regular_file()) {
-                    calculate_file_size(entry, result);
-                }
-            }
-        } catch (const std::filesystem::filesystem_error &e) {
-            result.error_list.push_back({
-                .path = directory_entry.path().string(),
-                .action = "lstat",
-                .error_code = e.code()
-            });
-        }
-    }
-
-    void scanner::calculate_directory_size(const std::filesystem::directory_entry &directory_entry,
-                                           scan_result &result) {
-        struct stat file_info{};
-        result.count_of_directories += 1;
-
-        if (lstat(directory_entry.path().c_str(), &file_info) != 0) {
-            result.error_list.push_back({
-                .path = directory_entry.path().string(),
-                .action = "lstat"
-            });
-        } else {
-            result.total_apparent_size += file_info.st_size;
-            result.total_allocated_size += file_info.st_blocks * 512;
-        }
-    }
-
-    void scanner::calculate_file_size(const std::filesystem::directory_entry &directory_entry, scan_result &result) {
-        struct stat file_info{};
-        result.count_of_files += 1;
-
-        if (lstat(directory_entry.path().c_str(), &file_info) != 0) {
-            result.error_list.push_back({
-                .path = directory_entry.path().string(),
-                .action = "lstat"
-            });
-        } else {
-            result.total_apparent_size += file_info.st_size;
-            result.total_allocated_size += file_info.st_blocks * 512;
-        }
-    }
-
-    void scanner::calculate_symlink_size(const std::filesystem::directory_entry &directory_entry, scan_result &result) {
-        struct stat file_info{};
-        result.count_of_symlinks += 1;
-
-        if (lstat(directory_entry.path().c_str(), &file_info) != 0) {
-            result.error_list.push_back({
-                .path = directory_entry.path().string(),
-                .action = "lstat"
-            });
-        } else {
-            result.total_apparent_size += file_info.st_size;
-            result.total_allocated_size += file_info.st_blocks * 512;
-        }
-    }
-
-    scan_result scanner::start_scanning(const std::string &dir) {
+    scan_result scanner::scan(const std::string &dir) {
         scan_result result = {
             .count_of_files = 0,
             .count_of_directories = 0,
             .count_of_symlinks = 0,
+            .count_of_others = 0,
             .total_apparent_size = 0,
             .total_allocated_size = 0
         };
 
-        try {
-            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir)) {
-                std::error_code error_code;
+        std::queue<std::filesystem::path> queue;
+        queue.emplace(dir);
 
-                const std::filesystem::directory_entry directory_entry(dir, error_code);
-                calculate_directory_size(directory_entry, result);
+        std::unordered_set<inode_key, inode_key_hash> seen_inodes;
 
-                if (!error_code) {
-                    scan_directory(directory_entry, result);
+        struct stat root_info{};
+        if (lstat(dir.c_str(), &root_info) == 0) {
+            if (S_ISDIR(root_info.st_mode)) {
+                ++result.count_of_directories;
+                result.total_allocated_size += static_cast<std::uint64_t>(root_info.st_blocks) * block_unit_bytes;
+                result.total_apparent_size += static_cast<std::uint64_t>(root_info.st_size);
+            } else if (S_ISLNK(root_info.st_mode)) {
+                result.error_list.push_back({
+                    .path = dir,
+                    .action = "dir is symlink",
+                    .error_code = std::error_code{}
+                });
+                return result;
+            } else {
+                result.error_list.push_back({
+                    .path = dir,
+                    .action = "dir is not directory",
+                    .error_code = std::error_code{}
+                });
+                return result;
+            }
+        } else {
+            const int err = errno;
+            result.error_list.push_back({
+                .path = dir,
+                .action = "lstat",
+                .error_code = std::error_code(err, std::generic_category())
+            });
+            return result;
+        }
+
+        while (!queue.empty()) {
+            std::filesystem::path current_path = std::move(queue.front());
+            queue.pop();
+
+            std::error_code ec;
+
+            std::filesystem::directory_iterator it(current_path, dir_opts, ec);
+            const std::filesystem::directory_iterator end;
+
+            if (ec) {
+                result.error_list.push_back({
+                    .path = current_path.string(),
+                    .action = "iterate",
+                    .error_code = ec
+                });
+                continue;
+            }
+
+            while (it != end) {
+                const auto &entry = *it;
+                bool should_count = false;
+
+                struct stat file_info{};
+
+                if (lstat(entry.path().c_str(), &file_info) == 0) {
+                    should_count = true;
+                    if (S_ISLNK(file_info.st_mode)) {
+                        ++result.count_of_symlinks;
+                    } else if (S_ISDIR(file_info.st_mode)) {
+                        ++result.count_of_directories;
+                        queue.emplace(entry.path());
+                    } else if (S_ISREG(file_info.st_mode)) {
+                        ++result.count_of_files;
+
+                        inode_key key{
+                            .device = file_info.st_dev,
+                            .inode = file_info.st_ino
+                        };
+                        if (!seen_inodes.insert(key).second) {
+                            should_count = false;
+                        }
+                    } else {
+                        ++result.count_of_others;
+                    }
                 } else {
+                    const int err = errno;
                     result.error_list.push_back({
-                        .path = dir,
-                        .action = "init",
-                        .error_code = error_code
+                        .path = entry.path().string(),
+                        .action = "lstat",
+                        .error_code = std::error_code(err, std::generic_category())
                     });
                 }
-            } else {
-                logger::error("provided path not exists or not a valid directory");
+
+                if (should_count) {
+                    result.total_allocated_size += static_cast<std::uint64_t>(file_info.st_blocks) * block_unit_bytes;
+                    result.total_apparent_size += static_cast<std::uint64_t>(file_info.st_size);
+                }
+
+                it.increment(ec);
+
+                if (ec) {
+                    result.error_list.push_back({
+                        .path = current_path.string(),
+                        .action = "increment",
+                        .error_code = ec
+                    });
+
+                    ec.clear();
+                    break;
+                }
             }
-        } catch (const std::filesystem::filesystem_error &e) {
-            logger::error(e.what());
         }
 
         return result;

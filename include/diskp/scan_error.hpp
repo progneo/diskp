@@ -15,9 +15,10 @@ namespace diskp {
         std::error_code error_code;
 
         [[nodiscard]] std::string get_message() const {
-            return "\npath: " + this->path +
-                   "\naction: " + this->action +
-                   "\nmessage: " + this->error_code.message();
+            return std::format("path: '{}'\naction: '{}\nmessage: '{}'",
+                               this->path,
+                               this->action,
+                               this->error_code.message());
         }
     };
 }
